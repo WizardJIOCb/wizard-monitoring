@@ -1,0 +1,30 @@
+/.vs/
+
+# .NET build output
+**/bin/
+**/obj/
+*.user
+
+# Published/local runtime artifacts
+/publish/
+**/publish/
+**/publish*/
+/runtime/
+/black_screen_logs/
+
+# Local telemetry and diagnostics
+*.log
+*.csv
+*.pid
+*.tmp
+*.bak
+*.err.txt
+*.out.txt
+*.debug.txt
+/cpu_temp_helper/cpu_temp*.txt
+/cpu_temp_helper/admin_list*.txt
+/thermal_*.txt
+
+# OS/editor noise
+Thumbs.db
+Desktop.ini
