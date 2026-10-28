@@ -6,7 +6,7 @@ $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RuntimeDir = Join-Path $ProjectRoot "runtime"
-$WidgetExe = Join-Path $ProjectRoot "publish\WizardMonitorAppSingle_v4\WizardMonitorApp.exe"
+$WidgetExe = Join-Path $ProjectRoot "publish\WizardMonitorAppSingle_v6\WizardMonitorApp.exe"
 $GpuScript = Join-Path $ProjectRoot "gpu_temp.ahk"
 $AhkExe = "C:\Program Files\AutoHotkey\v2\AutoHotkey64_UIA.exe"
 $AfterburnerExe = "C:\Program Files (x86)\MSI Afterburner\MSIAfterburner.exe"
@@ -318,7 +318,7 @@ if ($_widgetProcesses.Count -gt 0) {
         $legacyStillRunning = Get-Process -ErrorAction SilentlyContinue |
             Where-Object { $_.ProcessName -like "AutoHotkey*" -and $_.MainWindowTitle -eq "gpu_temp.ahk" } |
             Select-Object -First 1
-        $detail = if ($legacyStillRunning) { "v4, legacy AHK still running" } elseif ($legacyStopped -gt 0) { "v4, legacy AHK stopped" } else { "v4" }
+        $detail = if ($legacyStillRunning) { "v6, legacy AHK still running" } elseif ($legacyStopped -gt 0) { "v6, legacy AHK stopped" } else { "v6" }
         Write-Step "GPU/CPU widget" "already running" $detail
     } else {
         $stopResult = Stop-GpuWidgetProcesses -Processes $_widgetProcesses
@@ -326,7 +326,7 @@ if ($_widgetProcesses.Count -gt 0) {
             Write-Step "GPU/CPU widget" "restart failed" "old exe is still running; run start.bat as admin"
         } else {
             Start-Process -FilePath $WidgetExe -WorkingDirectory (Split-Path -Parent $WidgetExe) | Out-Null
-            Write-Step "GPU/CPU widget" "restarted" "v4"
+            Write-Step "GPU/CPU widget" "restarted" "v6"
         }
     }
 } else {

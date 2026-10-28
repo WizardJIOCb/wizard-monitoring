@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Globalization;
 using System.IO.MemoryMappedFiles;
+using Microsoft.Win32.SafeHandles;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -12,7 +13,7 @@ namespace WizardMonitorApp;
 internal static class Program
 {
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
         using var mutex = new Mutex(true, "WizardMonitoringTrayApp", out var createdNew);
         if (!createdNew)
@@ -21,7 +22,8 @@ internal static class Program
         }
 
         ApplicationConfiguration.Initialize();
-        Application.Run(new MonitorApplicationContext());
+        var openSettingsOnStart = args.Any(x => string.Equals(x, "--settings", StringComparison.OrdinalIgnoreCase));
+        Application.Run(new MonitorApplicationContext(openSettingsOnStart));
     }
 }
 
@@ -34,12 +36,17 @@ internal sealed class MonitorApplicationContext : ApplicationContext
     private readonly MetricsLogger _logger;
     private readonly EventLogger _eventLogger;
     private readonly System.Windows.Forms.Timer _timer;
+    private readonly System.Windows.Forms.Timer _weatherTimer;
     private readonly System.Windows.Forms.Timer _zOrderTimer;
+    private readonly WeatherReader _weatherReader = new();
+    private CancellationTokenSource? _weatherCancellation;
+    private int _weatherRequestVersion;
+    private WeatherSnapshot _lastWeather = WeatherSnapshot.Empty;
     private bool? _gpuTelemetryAvailable;
     private int _gpuTelemetryFailureCount;
     private DateTimeOffset? _gpuTelemetryLostAt;
 
-    public MonitorApplicationContext()
+    public MonitorApplicationContext(bool openSettingsOnStart = false)
     {
         _settings = AppSettings.Load();
         _reader = new MetricsReader(_settings);
@@ -65,6 +72,10 @@ internal sealed class MonitorApplicationContext : ApplicationContext
         _timer.Tick += (_, _) => UpdateMetrics();
         _timer.Start();
 
+        _weatherTimer = new System.Windows.Forms.Timer();
+        _weatherTimer.Tick += async (_, _) => await UpdateWeatherAsync();
+        ConfigureWeatherTimer(refreshNow: true);
+
         _zOrderTimer = new System.Windows.Forms.Timer
         {
             Interval = 500
@@ -73,6 +84,11 @@ internal sealed class MonitorApplicationContext : ApplicationContext
         _zOrderTimer.Start();
 
         UpdateMetrics();
+
+        if (openSettingsOnStart)
+        {
+            _overlay.BeginInvoke(new Action(OpenSettings));
+        }
     }
 
     private ContextMenuStrip BuildTrayMenu()
@@ -128,9 +144,103 @@ internal sealed class MonitorApplicationContext : ApplicationContext
         _timer.Interval = Math.Max(500, _settings.UpdateIntervalMs);
         _overlay.ApplySettings(_settings);
         _reader.ApplySettings(_settings);
+        ConfigureWeatherTimer(refreshNow: true);
         _trayIcon.ContextMenuStrip?.Dispose();
         _trayIcon.ContextMenuStrip = BuildTrayMenu();
         UpdateMetrics();
+    }
+
+    private void ConfigureWeatherTimer(bool refreshNow)
+    {
+        _weatherTimer.Stop();
+        var intervalMinutes = Math.Clamp(_settings.WeatherUpdateIntervalMinutes, 1, 1440);
+        _weatherTimer.Interval = checked(intervalMinutes * 60_000);
+
+        if (!_settings.ShowWeather)
+        {
+            _weatherCancellation?.Cancel();
+            _overlay.UpdateWeather(WeatherSnapshot.Empty);
+            return;
+        }
+
+        _weatherTimer.Start();
+        if (refreshNow)
+        {
+            _ = UpdateWeatherAsync();
+        }
+    }
+
+    private async Task UpdateWeatherAsync()
+    {
+        if (!_settings.ShowWeather)
+        {
+            return;
+        }
+
+        var city = _settings.WeatherCity.Trim();
+        if (city.Length == 0)
+        {
+            _overlay.UpdateWeather(new WeatherSnapshot { Error = "city-required" });
+            return;
+        }
+
+        var requestVersion = Interlocked.Increment(ref _weatherRequestVersion);
+        _weatherCancellation?.Cancel();
+        _weatherCancellation?.Dispose();
+        _weatherCancellation = new CancellationTokenSource();
+
+        try
+        {
+            var snapshot = await _weatherReader.ReadAsync(city, _weatherCancellation.Token);
+            if (requestVersion != _weatherRequestVersion || !_settings.ShowWeather)
+            {
+                return;
+            }
+
+            if (snapshot.TemperatureC.HasValue)
+            {
+                _lastWeather = snapshot;
+                _overlay.UpdateWeather(snapshot);
+                _eventLogger.Write(
+                    "WEATHER_UPDATED",
+                    MetricsSnapshot.Empty,
+                    "ok",
+                    $"city={snapshot.LocationName ?? city}; temp_c={snapshot.TemperatureC.Value.ToString("0.0", CultureInfo.InvariantCulture)}; weather_code={snapshot.WeatherCode?.ToString(CultureInfo.InvariantCulture) ?? ""}");
+            }
+            else if (_lastWeather.TemperatureC.HasValue &&
+                     string.Equals(_lastWeather.Query, city, StringComparison.OrdinalIgnoreCase))
+            {
+                _overlay.UpdateWeather(_lastWeather with { IsStale = true });
+                _eventLogger.Write("WEATHER_UPDATE_FAILED", MetricsSnapshot.Empty, snapshot.Error, $"city={city}; showing_stale=true");
+            }
+            else
+            {
+                _overlay.UpdateWeather(snapshot);
+                _eventLogger.Write("WEATHER_UPDATE_FAILED", MetricsSnapshot.Empty, snapshot.Error, $"city={city}; showing_stale=false");
+            }
+        }
+        catch (OperationCanceledException) when (_weatherCancellation.IsCancellationRequested)
+        {
+        }
+        catch (Exception)
+        {
+            if (requestVersion != _weatherRequestVersion)
+            {
+                return;
+            }
+
+            if (_lastWeather.TemperatureC.HasValue &&
+                string.Equals(_lastWeather.Query, city, StringComparison.OrdinalIgnoreCase))
+            {
+                _overlay.UpdateWeather(_lastWeather with { IsStale = true });
+                _eventLogger.Write("WEATHER_UPDATE_FAILED", MetricsSnapshot.Empty, "request-failed", $"city={city}; showing_stale=true");
+            }
+            else
+            {
+                _overlay.UpdateWeather(new WeatherSnapshot { Query = city, Error = "request-failed" });
+                _eventLogger.Write("WEATHER_UPDATE_FAILED", MetricsSnapshot.Empty, "request-failed", $"city={city}; showing_stale=false");
+            }
+        }
     }
 
     private void UpdateMetrics()
@@ -208,13 +318,17 @@ internal sealed class MonitorApplicationContext : ApplicationContext
     protected override void ExitThreadCore()
     {
         _timer.Stop();
+        _weatherTimer.Stop();
         _zOrderTimer.Stop();
+        _weatherCancellation?.Cancel();
+        _weatherCancellation?.Dispose();
         _settings.Location = _overlay.Location;
         _settings.Save();
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
         _overlay.Close();
         _reader.Dispose();
+        _weatherReader.Dispose();
         _logger.Dispose();
         _eventLogger.Dispose();
         base.ExitThreadCore();
@@ -238,14 +352,18 @@ internal sealed class OverlayForm : Form
     private readonly Label _diskC;
     private readonly Label _diskD;
     private readonly Label _diskE;
+    private readonly Label _diskReadRate;
+    private readonly Label _diskWriteRate;
     private readonly Label _power;
     private readonly Label _score;
+    private readonly Label _weather;
 
     private AppSettings _settings;
 
     public OverlayForm(AppSettings settings)
     {
         _settings = settings;
+        Text = "Wizard Monitoring Overlay";
         StartPosition = FormStartPosition.Manual;
         Location = settings.Location;
         Size = new Size(118, 1);
@@ -267,12 +385,15 @@ internal sealed class OverlayForm : Form
         _diskC = AddMetric(new Rectangle(0, 138, 118, 14), new Font("Segoe UI", 8), Palette.Disk, "C --/--G");
         _diskD = AddMetric(new Rectangle(0, 152, 118, 14), new Font("Segoe UI", 8), Palette.Disk, "D --/--G");
         _diskE = AddMetric(new Rectangle(0, 166, 118, 14), new Font("Segoe UI", 8), Palette.Disk, "E --/--G");
-        _power = AddMetric(new Rectangle(0, 180, 118, 14), new Font("Segoe UI", 8), Palette.Power, "pwr --/--W");
-        _netUp = AddMetric(new Rectangle(0, 194, 118, 14), new Font("Segoe UI", 8), Palette.Net, "up --");
-        _netDown = AddMetric(new Rectangle(0, 208, 118, 14), new Font("Segoe UI", 8), Palette.Net, "dn --");
-        _netSentTotal = AddMetric(new Rectangle(0, 222, 118, 14), new Font("Segoe UI", 8), Palette.NetTotal, "tx --");
-        _netReceivedTotal = AddMetric(new Rectangle(0, 236, 118, 14), new Font("Segoe UI", 8), Palette.NetTotal, "rx --");
-        _score = AddMetric(new Rectangle(0, 250, 118, 14), new Font("Segoe UI", 8, FontStyle.Bold), Palette.Score, "cap --");
+        _diskReadRate = AddMetric(new Rectangle(0, 180, 118, 14), new Font("Segoe UI", 8), Palette.Disk, "rd --");
+        _diskWriteRate = AddMetric(new Rectangle(0, 194, 118, 14), new Font("Segoe UI", 8), Palette.Disk, "wr --");
+        _power = AddMetric(new Rectangle(0, 208, 118, 14), new Font("Segoe UI", 8), Palette.Power, "pwr --/--W");
+        _netUp = AddMetric(new Rectangle(0, 222, 118, 14), new Font("Segoe UI", 8), Palette.Net, "up --");
+        _netDown = AddMetric(new Rectangle(0, 236, 118, 14), new Font("Segoe UI", 8), Palette.Net, "dn --");
+        _netSentTotal = AddMetric(new Rectangle(0, 250, 118, 14), new Font("Segoe UI", 8), Palette.NetTotal, "tx --");
+        _netReceivedTotal = AddMetric(new Rectangle(0, 264, 118, 14), new Font("Segoe UI", 8), Palette.NetTotal, "rx --");
+        _score = AddMetric(new Rectangle(0, 278, 118, 14), new Font("Segoe UI", 8, FontStyle.Bold), Palette.Score, "cap --");
+        _weather = AddMetric(new Rectangle(0, 292, 118, 30), new Font("Segoe UI", 7.5f), Palette.Weather, "weather --");
 
         SetClickThrough(settings.ClickThrough);
         ApplyMetricVisibility();
@@ -330,12 +451,44 @@ internal sealed class OverlayForm : Form
         SetMetric(_diskC, FormatDisk("C", snapshot.DiskC), DiskColor(snapshot.DiskC, _settings.PlainDiskColor));
         SetMetric(_diskD, FormatDisk("D", snapshot.DiskD), DiskColor(snapshot.DiskD, _settings.PlainDiskColor));
         SetMetric(_diskE, FormatDisk("E", snapshot.DiskE), DiskColor(snapshot.DiskE, _settings.PlainDiskColor));
+        SetMetric(_diskReadRate, "rd " + FormatDiskRate(snapshot.DiskReadBytesPerSec), Palette.Disk);
+        SetMetric(_diskWriteRate, "wr " + FormatDiskRate(snapshot.DiskWriteBytesPerSec), Palette.Disk);
         SetMetric(_power, FormatPower(snapshot.CpuPowerW, snapshot.GpuPowerW), PowerColor(snapshot.CpuPowerW, snapshot.GpuPowerW));
         SetMetric(_netUp, "up " + (snapshot.NetUpText ?? "--"), Palette.Net);
         SetMetric(_netDown, "dn " + (snapshot.NetDownText ?? "--"), Palette.Net);
         SetMetric(_netSentTotal, "tx " + (snapshot.NetSentTotalText ?? "--"), Palette.NetTotal);
         SetMetric(_netReceivedTotal, "rx " + (snapshot.NetReceivedTotalText ?? "--"), Palette.NetTotal);
         SetMetric(_score, FormatScore(snapshot.LoadScore), LoadColor(snapshot.LoadScore, 70, 88, Palette.Score));
+    }
+
+    public void UpdateWeather(WeatherSnapshot snapshot)
+    {
+        if (!_settings.ShowWeather)
+        {
+            return;
+        }
+
+        if (!snapshot.TemperatureC.HasValue)
+        {
+            var errorText = snapshot.Error switch
+            {
+                "city-required" => "задай город\nв настройках",
+                "city-not-found" => "город не найден",
+                _ => "погода n/a"
+            };
+            SetMetric(_weather, errorText, Palette.Danger);
+            return;
+        }
+
+        var city = string.IsNullOrWhiteSpace(snapshot.LocationName)
+            ? snapshot.Query
+            : snapshot.LocationName;
+        var staleMarker = snapshot.IsStale ? "~" : "";
+        var temperature = snapshot.TemperatureC.Value > 0
+            ? $"+{snapshot.TemperatureC.Value:0}°"
+            : $"{snapshot.TemperatureC.Value:0}°";
+        var condition = WeatherCodeText(snapshot.WeatherCode);
+        SetMetric(_weather, $"{city}\n{staleMarker}{temperature} {condition}", snapshot.IsStale ? Palette.Warn : Palette.Weather);
     }
 
     private void ApplyMetricVisibility()
@@ -358,12 +511,15 @@ internal sealed class OverlayForm : Form
         LayoutMetric(_diskC, _settings.ShowDiskC, 14, ref y);
         LayoutMetric(_diskD, _settings.ShowDiskD, 14, ref y);
         LayoutMetric(_diskE, _settings.ShowDiskE, 14, ref y);
+        LayoutMetric(_diskReadRate, _settings.ShowDiskRates, 14, ref y);
+        LayoutMetric(_diskWriteRate, _settings.ShowDiskRates, 14, ref y);
         LayoutMetric(_power, _settings.ShowPower, 14, ref y);
         LayoutMetric(_netUp, _settings.ShowNetworkRates, 14, ref y);
         LayoutMetric(_netDown, _settings.ShowNetworkRates, 14, ref y);
         LayoutMetric(_netSentTotal, _settings.ShowNetworkTotals, 14, ref y);
         LayoutMetric(_netReceivedTotal, _settings.ShowNetworkTotals, 14, ref y);
         LayoutMetric(_score, _settings.ShowLoadScore, 14, ref y);
+        LayoutMetric(_weather, _settings.ShowWeather, 30, ref y);
 
         Size = new Size(118, Math.Max(1, y + 4));
         Invalidate();
@@ -479,6 +635,33 @@ internal sealed class OverlayForm : Form
         return string.Format(CultureInfo.InvariantCulture, "{0} {1:0}/{2:0}G", label, usedGb, totalGb);
     }
 
+    private static string FormatDiskRate(double? bytesPerSecond)
+    {
+        if (!bytesPerSecond.HasValue)
+        {
+            return "--";
+        }
+
+        var bytes = Math.Max(0, bytesPerSecond.Value);
+        if (bytes >= 1024.0 * 1024.0 * 1024.0)
+        {
+            return $"{bytes / (1024.0 * 1024.0 * 1024.0):0.0}G/s";
+        }
+
+        if (bytes >= 1024.0 * 1024.0)
+        {
+            return $"{bytes / (1024.0 * 1024.0):0.0}M/s";
+        }
+
+        if (bytes >= 1024.0)
+        {
+            var kibibytes = bytes / 1024.0;
+            return kibibytes < 100 ? $"{kibibytes:0.0}K/s" : $"{kibibytes:0}K/s";
+        }
+
+        return $"{bytes:0}B/s";
+    }
+
     private static string FormatPower(double? cpuPowerW, double? gpuPowerW)
     {
         if (!cpuPowerW.HasValue && !gpuPowerW.HasValue)
@@ -496,6 +679,29 @@ internal sealed class OverlayForm : Form
         return score.HasValue
             ? $"cap {score.Value:0}"
             : "cap --";
+    }
+
+    private static string WeatherCodeText(int? code)
+    {
+        return code switch
+        {
+            0 => "ясно",
+            1 => "малооблачно",
+            2 => "облачно",
+            3 => "пасмурно",
+            45 or 48 => "туман",
+            51 or 53 or 55 => "морось",
+            56 or 57 => "ледяная морось",
+            61 or 63 or 65 => "дождь",
+            66 or 67 => "ледяной дождь",
+            71 or 73 or 75 => "снег",
+            77 => "снежная крупа",
+            80 or 81 or 82 => "ливень",
+            85 or 86 => "снегопад",
+            95 => "гроза",
+            96 or 99 => "гроза с градом",
+            _ => "погода"
+        };
     }
 
     private static void SetMetric(Label label, string text, Color color)
@@ -576,7 +782,9 @@ internal sealed class SettingsForm : Form
 {
     private readonly AppSettings _settings;
     private readonly NumericUpDown _interval;
+    private readonly NumericUpDown _weatherInterval;
     private readonly TextBox _adapter;
+    private readonly TextBox _weatherCity;
     private readonly CheckBox _topMost;
     private readonly CheckBox _background;
     private readonly CheckBox _clickThrough;
@@ -591,10 +799,12 @@ internal sealed class SettingsForm : Form
     private readonly CheckBox _showDiskC;
     private readonly CheckBox _showDiskD;
     private readonly CheckBox _showDiskE;
+    private readonly CheckBox _showDiskRates;
     private readonly CheckBox _showPower;
     private readonly CheckBox _showNetworkRates;
     private readonly CheckBox _showNetworkTotals;
     private readonly CheckBox _showLoadScore;
+    private readonly CheckBox _showWeather;
     private readonly CheckBox _plainDiskColor;
 
     public SettingsForm(AppSettings settings)
@@ -605,7 +815,7 @@ internal sealed class SettingsForm : Form
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
-        ClientSize = new Size(520, 508);
+        ClientSize = new Size(520, 620);
 
         _interval = new NumericUpDown
         {
@@ -622,25 +832,40 @@ internal sealed class SettingsForm : Form
             Location = new Point(160, 52),
             Size = new Size(325, 23)
         };
+        _weatherCity = new TextBox
+        {
+            Text = settings.WeatherCity,
+            Location = new Point(160, 86),
+            Size = new Size(325, 23)
+        };
+        _weatherInterval = new NumericUpDown
+        {
+            Minimum = 1,
+            Maximum = 1440,
+            Increment = 1,
+            Value = Math.Clamp(settings.WeatherUpdateIntervalMinutes, 1, 1440),
+            Location = new Point(160, 120),
+            Size = new Size(165, 23)
+        };
         _topMost = new CheckBox
         {
             Text = "Always on top",
             Checked = settings.TopMost,
-            Location = new Point(25, 86),
+            Location = new Point(25, 154),
             Size = new Size(160, 24)
         };
         _background = new CheckBox
         {
             Text = "Subtle background",
             Checked = settings.ShowBackground,
-            Location = new Point(25, 112),
+            Location = new Point(25, 180),
             Size = new Size(160, 24)
         };
         _clickThrough = new CheckBox
         {
             Text = "Click through",
             Checked = settings.ClickThrough,
-            Location = new Point(25, 138),
+            Location = new Point(25, 206),
             Size = new Size(160, 24)
         };
 
@@ -648,6 +873,10 @@ internal sealed class SettingsForm : Form
         Controls.Add(_interval);
         Controls.Add(new Label { Text = "Network adapter", Location = new Point(25, 55), AutoSize = true });
         Controls.Add(_adapter);
+        Controls.Add(new Label { Text = "Weather city", Location = new Point(25, 89), AutoSize = true });
+        Controls.Add(_weatherCity);
+        Controls.Add(new Label { Text = "Weather update, min", Location = new Point(25, 123), AutoSize = true });
+        Controls.Add(_weatherInterval);
         Controls.Add(_topMost);
         Controls.Add(_background);
         Controls.Add(_clickThrough);
@@ -655,8 +884,8 @@ internal sealed class SettingsForm : Form
         var rows = new GroupBox
         {
             Text = "Overlay rows",
-            Location = new Point(25, 172),
-            Size = new Size(460, 246)
+            Location = new Point(25, 240),
+            Size = new Size(460, 272)
         };
 
         _showGpuTemp = AddRowCheckBox(rows, "GPU temperature", settings.ShowGpuTemp, 15, 24);
@@ -671,23 +900,25 @@ internal sealed class SettingsForm : Form
         _showDiskC = AddRowCheckBox(rows, "Disk C", settings.ShowDiskC, 240, 50);
         _showDiskD = AddRowCheckBox(rows, "Disk D", settings.ShowDiskD, 240, 76);
         _showDiskE = AddRowCheckBox(rows, "Disk E", settings.ShowDiskE, 240, 102);
-        _showPower = AddRowCheckBox(rows, "Power", settings.ShowPower, 240, 128);
-        _showNetworkRates = AddRowCheckBox(rows, "Network up/down", settings.ShowNetworkRates, 240, 154);
-        _showNetworkTotals = AddRowCheckBox(rows, "Network tx/rx", settings.ShowNetworkTotals, 240, 180);
-        _showLoadScore = AddRowCheckBox(rows, "Cap score", settings.ShowLoadScore, 240, 206);
+        _showDiskRates = AddRowCheckBox(rows, "Disk read/write", settings.ShowDiskRates, 240, 128);
+        _showPower = AddRowCheckBox(rows, "Power", settings.ShowPower, 240, 154);
+        _showNetworkRates = AddRowCheckBox(rows, "Network up/down", settings.ShowNetworkRates, 240, 180);
+        _showNetworkTotals = AddRowCheckBox(rows, "Network tx/rx", settings.ShowNetworkTotals, 240, 206);
+        _showLoadScore = AddRowCheckBox(rows, "Cap score", settings.ShowLoadScore, 15, 206);
+        _showWeather = AddRowCheckBox(rows, "Weather", settings.ShowWeather, 15, 232);
         Controls.Add(rows);
 
         _plainDiskColor = new CheckBox
         {
             Text = "Plain disk color",
             Checked = settings.PlainDiskColor,
-            Location = new Point(25, 430),
+            Location = new Point(25, 524),
             Size = new Size(200, 24)
         };
         Controls.Add(_plainDiskColor);
 
-        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Location = new Point(330, 467), Size = new Size(75, 26) };
-        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(410, 467), Size = new Size(75, 26) };
+        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Location = new Point(330, 579), Size = new Size(75, 26) };
+        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(410, 579), Size = new Size(75, 26) };
         Controls.Add(ok);
         Controls.Add(cancel);
         AcceptButton = ok;
@@ -714,6 +945,8 @@ internal sealed class SettingsForm : Form
         {
             _settings.UpdateIntervalMs = (int)_interval.Value;
             _settings.NetAdapterMatch = _adapter.Text.Trim();
+            _settings.WeatherCity = _weatherCity.Text.Trim();
+            _settings.WeatherUpdateIntervalMinutes = (int)_weatherInterval.Value;
             _settings.TopMost = _topMost.Checked;
             _settings.ShowBackground = _background.Checked;
             _settings.ClickThrough = _clickThrough.Checked;
@@ -728,10 +961,12 @@ internal sealed class SettingsForm : Form
             _settings.ShowDiskC = _showDiskC.Checked;
             _settings.ShowDiskD = _showDiskD.Checked;
             _settings.ShowDiskE = _showDiskE.Checked;
+            _settings.ShowDiskRates = _showDiskRates.Checked;
             _settings.ShowPower = _showPower.Checked;
             _settings.ShowNetworkRates = _showNetworkRates.Checked;
             _settings.ShowNetworkTotals = _showNetworkTotals.Checked;
             _settings.ShowLoadScore = _showLoadScore.Checked;
+            _settings.ShowWeather = _showWeather.Checked;
             _settings.PlainDiskColor = _plainDiskColor.Checked;
         }
 
@@ -747,6 +982,7 @@ internal sealed class MetricsReader : IDisposable
     private readonly AfterburnerReader _afterburner = new();
     private readonly MemoryReader _memory = new();
     private readonly DiskReader _disk = new();
+    private readonly DiskRateReader _diskRate = new();
     private readonly NetworkRateReader _network;
 
     public MetricsReader(AppSettings settings)
@@ -767,6 +1003,7 @@ internal sealed class MetricsReader : IDisposable
         var diskC = _disk.Read("C");
         var diskD = _disk.Read("D");
         var diskE = _disk.Read("E");
+        var diskRate = _diskRate.Read();
         var network = _network.Read();
         var cpuPct = _cpuUsage.Read();
         var cpuTemp = _cpuTemp.Read() ?? afterburner.CpuTempC;
@@ -793,6 +1030,8 @@ internal sealed class MetricsReader : IDisposable
             DiskC = diskC,
             DiskD = diskD,
             DiskE = diskE,
+            DiskReadBytesPerSec = diskRate.ReadBytesPerSec,
+            DiskWriteBytesPerSec = diskRate.WriteBytesPerSec,
             GpuTempC = gpu.TempC,
             GpuPct = gpu.UtilPct,
             GpuMemPct = gpu.MemPct,
@@ -868,6 +1107,7 @@ internal sealed class MetricsReader : IDisposable
     public void Dispose()
     {
         _gpu.Dispose();
+        _diskRate.Dispose();
     }
 }
 
@@ -1419,6 +1659,114 @@ internal sealed class DiskReader
     }
 }
 
+internal sealed class DiskRateReader : IDisposable
+{
+    private readonly List<DiskDevice> _devices = new();
+    private long _previousTimestamp;
+
+    public DiskRateReader()
+    {
+        for (var index = 0; index < 32; index++)
+        {
+            var handle = NativeMethods.CreateFile(
+                $@"\\.\PhysicalDrive{index}",
+                0,
+                NativeMethods.FileShareRead | NativeMethods.FileShareWrite,
+                IntPtr.Zero,
+                NativeMethods.OpenExisting,
+                0,
+                IntPtr.Zero);
+
+            if (handle.IsInvalid)
+            {
+                handle.Dispose();
+                continue;
+            }
+
+            _devices.Add(new DiskDevice(handle));
+        }
+    }
+
+    public DiskRateSnapshot Read()
+    {
+        var timestamp = Stopwatch.GetTimestamp();
+        var elapsedSeconds = _previousTimestamp == 0
+            ? 0
+            : Stopwatch.GetElapsedTime(_previousTimestamp, timestamp).TotalSeconds;
+        var readBytes = 0L;
+        var writeBytes = 0L;
+        var hasDelta = false;
+
+        foreach (var device in _devices)
+        {
+            if (!TryReadCounters(device.Handle, out var counters))
+            {
+                device.HasPreviousSample = false;
+                continue;
+            }
+
+            if (device.HasPreviousSample)
+            {
+                readBytes += Math.Max(0, counters.BytesRead - device.BytesRead);
+                writeBytes += Math.Max(0, counters.BytesWritten - device.BytesWritten);
+                hasDelta = true;
+            }
+
+            device.BytesRead = counters.BytesRead;
+            device.BytesWritten = counters.BytesWritten;
+            device.HasPreviousSample = true;
+        }
+
+        _previousTimestamp = timestamp;
+        if (!hasDelta || elapsedSeconds <= 0)
+        {
+            return DiskRateSnapshot.Empty;
+        }
+
+        return new DiskRateSnapshot
+        {
+            ReadBytesPerSec = Math.Round(readBytes / elapsedSeconds, 0),
+            WriteBytesPerSec = Math.Round(writeBytes / elapsedSeconds, 0)
+        };
+    }
+
+    private static bool TryReadCounters(SafeFileHandle handle, out DiskPerformance counters)
+    {
+        return NativeMethods.DeviceIoControl(
+            handle,
+            NativeMethods.IoctlDiskPerformance,
+            IntPtr.Zero,
+            0,
+            out counters,
+            (uint)Marshal.SizeOf<DiskPerformance>(),
+            out _,
+            IntPtr.Zero);
+    }
+
+    public void Dispose()
+    {
+        foreach (var device in _devices)
+        {
+            device.Handle.Dispose();
+        }
+
+        _devices.Clear();
+    }
+
+    private sealed class DiskDevice
+    {
+        public DiskDevice(SafeFileHandle handle)
+        {
+            Handle = handle;
+        }
+
+        public SafeFileHandle Handle { get; }
+        public long BytesRead { get; set; }
+        public long BytesWritten { get; set; }
+        public bool HasPreviousSample { get; set; }
+    }
+}
+
 internal sealed class NetworkRateReader
 {
     private readonly Dictionary<string, NetCounters> _previous = new(StringComparer.OrdinalIgnoreCase);
@@ -1578,6 +1926,116 @@ internal sealed class NetworkRateReader
     }
 }
 
+internal sealed class WeatherReader : IDisposable
+{
+    private readonly HttpClient _httpClient;
+    private string? _cachedQuery;
+    private WeatherLocation? _cachedLocation;
+
+    public WeatherReader()
+    {
+        _httpClient = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(12)
+        };
+        _httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("WizardMonitoring/1.0");
+    }
+
+    public async Task<WeatherSnapshot> ReadAsync(string city, CancellationToken cancellationToken)
+    {
+        var query = city.Trim();
+        if (query.Length == 0)
+        {
+            return new WeatherSnapshot { Error = "city-required" };
+        }
+
+        var location = await ResolveLocationAsync(query, cancellationToken);
+        if (location is null)
+        {
+            return new WeatherSnapshot { Query = query, Error = "city-not-found" };
+        }
+
+        var forecastUrl = "https://api.open-meteo.com/v1/forecast" +
+                          "?latitude=" + location.Latitude.ToString(CultureInfo.InvariantCulture) +
+                          "&longitude=" + location.Longitude.ToString(CultureInfo.InvariantCulture) +
+                          "&current=temperature_2m,weather_code" +
+                          "&temperature_unit=celsius&timezone=auto&forecast_days=1";
+
+        using var response = await _httpClient.GetAsync(forecastUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+
+        if (!document.RootElement.TryGetProperty("current", out var current) ||
+            !current.TryGetProperty("temperature_2m", out var temperature) ||
+            !temperature.TryGetDouble(out var temperatureC))
+        {
+            return new WeatherSnapshot { Query = query, LocationName = location.Name, Error = "invalid-response" };
+        }
+
+        int? weatherCode = null;
+        if (current.TryGetProperty("weather_code", out var code) && code.TryGetInt32(out var parsedCode))
+        {
+            weatherCode = parsedCode;
+        }
+
+        return new WeatherSnapshot
+        {
+            Query = query,
+            LocationName = location.Name,
+            TemperatureC = temperatureC,
+            WeatherCode = weatherCode,
+            FetchedAt = DateTimeOffset.Now
+        };
+    }
+
+    private async Task<WeatherLocation?> ResolveLocationAsync(string query, CancellationToken cancellationToken)
+    {
+        if (_cachedLocation is not null && string.Equals(_cachedQuery, query, StringComparison.OrdinalIgnoreCase))
+        {
+            return _cachedLocation;
+        }
+
+        var geocodingUrl = "https://geocoding-api.open-meteo.com/v1/search?name=" +
+                           Uri.EscapeDataString(query) +
+                           "&count=1&language=ru&format=json";
+
+        using var response = await _httpClient.GetAsync(geocodingUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+
+        if (!document.RootElement.TryGetProperty("results", out var results) ||
+            results.ValueKind != JsonValueKind.Array ||
+            results.GetArrayLength() == 0)
+        {
+            return null;
+        }
+
+        var first = results[0];
+        if (!first.TryGetProperty("latitude", out var latitudeElement) ||
+            !latitudeElement.TryGetDouble(out var latitude) ||
+            !first.TryGetProperty("longitude", out var longitudeElement) ||
+            !longitudeElement.TryGetDouble(out var longitude))
+        {
+            return null;
+        }
+
+        var name = first.TryGetProperty("name", out var nameElement)
+            ? nameElement.GetString()
+            : null;
+
+        _cachedQuery = query;
+        _cachedLocation = new WeatherLocation(name ?? query, latitude, longitude);
+        return _cachedLocation;
+    }
+
+    public void Dispose()
+    {
+        _httpClient.Dispose();
+    }
+}
+
 internal sealed class AppSettings
 {
     private static readonly string SettingsPath = Path.Combine(
@@ -1591,6 +2049,8 @@ internal sealed class AppSettings
     public bool ShowBackground { get; set; }
     public int UpdateIntervalMs { get; set; } = 1000;
     public string NetAdapterMatch { get; set; } = "Realtek 8812BU";
+    public string WeatherCity { get; set; } = "";
+    public int WeatherUpdateIntervalMinutes { get; set; } = 10;
     public bool ShowGpuTemp { get; set; } = true;
     public bool ShowCpuTemp { get; set; } = true;
     public bool ShowFanPct { get; set; } = true;
@@ -1602,10 +2062,12 @@ internal sealed class AppSettings
     public bool ShowDiskC { get; set; } = true;
     public bool ShowDiskD { get; set; } = true;
     public bool ShowDiskE { get; set; } = true;
+    public bool ShowDiskRates { get; set; } = true;
     public bool ShowPower { get; set; } = true;
     public bool ShowNetworkRates { get; set; } = true;
     public bool ShowNetworkTotals { get; set; } = true;
     public bool ShowLoadScore { get; set; } = true;
+    public bool ShowWeather { get; set; }
     public bool PlainDiskColor { get; set; }
 
     public static AppSettings Load()
@@ -1828,6 +2290,8 @@ internal record MetricsSnapshot
     public DiskSnapshot? DiskC { get; init; }
     public DiskSnapshot? DiskD { get; init; }
     public DiskSnapshot? DiskE { get; init; }
+    public double? DiskReadBytesPerSec { get; init; }
+    public double? DiskWriteBytesPerSec { get; init; }
     public double? GpuTempC { get; init; }
     public double? GpuPct { get; init; }
     public double? GpuMemPct { get; init; }
@@ -1913,6 +2377,29 @@ internal sealed record DiskSnapshot
     public double? UsedPct { get; init; }
 }
 
+internal sealed record DiskRateSnapshot
+{
+    public static DiskRateSnapshot Empty { get; } = new();
+
+    public double? ReadBytesPerSec { get; init; }
+    public double? WriteBytesPerSec { get; init; }
+}
+
+internal sealed record WeatherSnapshot
+{
+    public static WeatherSnapshot Empty { get; } = new();
+
+    public string? Query { get; init; }
+    public string? LocationName { get; init; }
+    public double? TemperatureC { get; init; }
+    public int? WeatherCode { get; init; }
+    public DateTimeOffset? FetchedAt { get; init; }
+    public string? Error { get; init; }
+    public bool IsStale { get; init; }
+}
+
+internal sealed record WeatherLocation(string Name, double Latitude, double Longitude);
+
 internal readonly record struct NetCounters(long Sent, long Received, DateTime Time);
 
 internal static class Palette
@@ -1926,6 +2413,7 @@ internal static class Palette
     public static readonly Color Disk = Color.FromArgb(214, 232, 255);
     public static readonly Color Power = Color.FromArgb(255, 230, 190);
     public static readonly Color Score = Color.FromArgb(220, 255, 220);
+    public static readonly Color Weather = Color.FromArgb(178, 226, 255);
     public static readonly Color Warn = Color.FromArgb(255, 179, 71);
     public static readonly Color Danger = Color.FromArgb(255, 77, 77);
 }
@@ -1933,6 +2421,10 @@ internal static class Palette
 internal static class NativeMethods
 {
     public const uint PdhFmtDouble = 0x00000200;
+    public const uint FileShareRead = 0x00000001;
+    public const uint FileShareWrite = 0x00000002;
+    public const uint OpenExisting = 3;
+    public const uint IoctlDiskPerformance = 0x00070020;
     public const uint SwpNoSize = 0x0001;
     public const uint SwpNoMove = 0x0002;
     public const uint SwpNoActivate = 0x0010;
@@ -1959,6 +2451,27 @@ internal static class NativeMethods
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool GlobalMemoryStatusEx(ref MemoryStatusEx status);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern SafeFileHandle CreateFile(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool DeviceIoControl(
+        SafeFileHandle device,
+        uint controlCode,
+        IntPtr inputBuffer,
+        uint inputBufferSize,
+        out DiskPerformance outputBuffer,
+        uint outputBufferSize,
+        out uint bytesReturned,
+        IntPtr overlapped);
 
     [DllImport("nvml.dll", EntryPoint = "nvmlInit_v2", CallingConvention = CallingConvention.Cdecl)]
     public static extern int NvmlInit();
@@ -2015,6 +2528,25 @@ internal struct MemoryStatusEx
     public ulong TotalVirtual;
     public ulong AvailVirtual;
     public ulong AvailExtendedVirtual;
+}
+
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+internal struct DiskPerformance
+{
+    public long BytesRead;
+    public long BytesWritten;
+    public long ReadTime;
+    public long WriteTime;
+    public long IdleTime;
+    public uint ReadCount;
+    public uint WriteCount;
+    public uint QueueDepth;
+    public uint SplitCount;
+    public long QueryTime;
+    public uint StorageDeviceNumber;
+
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 8)]
+    public string StorageManagerName;
 }
 
 [StructLayout(LayoutKind.Sequential)]
